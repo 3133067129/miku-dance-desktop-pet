@@ -1,0 +1,110 @@
+桌宠主程序（12 个 .py 文件）
+├─ 1) 入口与装配（main.py）
+│  ├─ 读取配置（config.py / AppConfig）
+│  │  ├─ 音频：samplerate / blocksize / analysis_hz
+│  │  ├─ 分析：gate / hold_sec / min_beat_interval
+│  │  ├─ UI：base_size / ui_fps / always_on_top / scale_step
+│  │  └─ 自动编舞：auto_choreo / debounce / min_energy / min_session_sec
+│  ├─ 选择音频输入设备（audio_device.py）
+│  │  ├─ sounddevice.query_devices()
+│  │  └─ 启发式打分 → 选 VB-Cable（CABLE Output / Virtual Cable）
+│  ├─ 初始化音乐分析器（music_analyzer.py / MusicAnalyzer）
+│  ├─ 初始化音频引擎（audio_engine.py / AudioEngine）
+│  │  ├─ 启动 InputStream（sounddevice）
+│  │  ├─ 回调线程：写入 RingBuffer
+│  │  └─ UI 线程：QTimer 定时取窗 → analyzer → emit music_state
+│  ├─ 初始化跟拍动画库（animation_bank.py / AnimationBank）
+│  ├─ 初始化歌曲探测器（song_detector.py / SongDetector）
+│  ├─ 初始化编舞库（choreo_library.py / ChoreoLibrary）
+│  │  └─ add(song_key -> ChoreoEntry(frames_dir, fps, start_offset_sec))
+│  ├─ 初始化桌宠窗口（pet_window.py / PetWindow）
+│  │  └─ 连接信号：AudioEngine.music_state → PetWindow.on_music_state
+│  └─ 进入 Qt 事件循环（QApplication.exec）
+
+├─ 2) 实时音频采集与分析链路
+│  ├─ 音频采集（audio_engine.py）
+│  │  ├─ sounddevice.InputStream 回调（音频线程）
+│  │  │  ├─ 输入多通道 → 取均值变单声道
+│  │  │  └─ 写入环形缓冲（ring_buffer.py / RingBuffer.write）
+│  │  └─ QTimer tick（UI 线程）
+│  │     ├─ 从 RingBuffer 取最近 N 样本（read_last）
+│  │     ├─ 调用 MusicAnalyzer.process_window(samples, t)
+│  │     └─ emit music_state(MusicState)
+│  ├─ 环形缓冲（ring_buffer.py）
+│  │  ├─ write(samples)：跨线程写入
+│  │  └─ read_last(n)：跨线程读取最近窗口
+│  └─ 音乐分析（music_analyzer.py）
+│     ├─ 能量 energy：RMS → 缩放 → clamp → 指数平滑
+│     ├─ 会话 session：energy>gate 进入；低于 gate 用 hold_sec 滞回退出
+│     ├─ 拍点 beat：能量差分 diff + 自适应阈值 + 最小拍间隔
+│     └─ BPM：beat 间隔估计 → 限制范围 → 倍频/半频折算 → 平滑
+
+├─ 3) UI 窗口与两种播放模式（pet_window.py）
+│  ├─ 通用：窗口透明/置顶/拖拽/缩放
+│  │  ├─ wheelEvent 缩放：保持窗口中心不漂移
+│  │  └─ 缓存清理：缩放后清 scaled cache（跟拍）或清 pixmap cache（编舞）
+│  ├─ 模式 A：跟拍模式（Follow / 非编舞）
+│  │  ├─ 输入：MusicState（来自 on_music_state）
+│  │  ├─ 决策：
+│  │  │  ├─ 不在 session 或能量低 → idle
+│  │  │  ├─ 在 session → dance_slow/mid/fast（按 bpm 阈值）
+│  │  │  └─ beat 为真 → 短暂触发 accent（强调动作）
+│  │  ├─ 动画来源：AnimationBank.get_scaled_frames(clip, size)
+│  │  └─ 播放：按 ui_fps 或内部 tick 更新帧 index → setPixmap
+│  └─ 模式 B：编舞模式（Choreo）
+│     ├─ 触发：自动编舞 tick（_auto_choreo_tick）
+│     ├─ 编舞开始：_start_choreo(entry)
+│     │  ├─ 创建/替换 SequenceDiskSource(entry.frames_dir)
+│     │  ├─ 创建 ChoreographyPlayer(entry.fps, entry.start_offset_sec)
+│     │  └─ 设置状态：进入 choreo_active
+│     ├─ 编舞播放 tick（_choreo_tick）
+│     │  ├─ frame_i = ChoreographyPlayer.frame_index()
+│     │  ├─ pix = SequenceDiskSource.get_frame(frame_i, size)
+│     │  ├─ setPixmap(pix)
+│     │  └─ 超出总帧数 → stop_choreo → 回到跟拍模式
+│     └─ 编舞结束：_stop_choreo() 清理状态与资源
+
+├─ 4) 自动编舞：歌曲识别 → 编舞库匹配 → 防抖 → 启动编舞
+│  ├─ 歌曲识别（song_detector.py / SongDetector.latest）
+│  │  ├─ 后端 1：SMTC（系统媒体会话，优先）
+│  │  ├─ 后端 2：AIMP Remote API（pyaimp）
+│  │  ├─ 后端 3：AIMP 窗口标题兜底（win32gui / EnumWindows）
+│  │  ├─ 评分/过滤：
+│  │  │  ├─ 强来源分高（SMTC/Remote API）
+│  │  │  ├─ 标题黑名单过滤（如“可视化”等坏标题）
+│  │  │  └─ 识别失败时保持 stable（hold_bad_sec）
+│  │  └─ 输出：SongInfo(title, artist, source, score, timestamp)
+│  ├─ 编舞库（choreo_library.py）
+│  │  ├─ _norm：统一大小写/空白/符号
+│  │  ├─ add：song_key -> ChoreoEntry
+│  │  └─ match：返回 entry 或 None
+│  ├─ PetWindow 内匹配 key 生成
+│  │  ├─ key1："{title} - {artist}"
+│  │  └─ key2："{title}"（无 artist 兜底）
+│  ├─ 防抖与避免重复
+│  │  ├─ debounce_sec：同一首歌连续命中一段时间才启动
+│  │  ├─ 已在编舞且同歌 → 不重复启动
+│  │  └─ 同歌但未进编舞 → 仍允许继续尝试匹配（修复“错过切换”）
+│  └─ 启动编舞：_start_choreo(entry)
+
+├─ 5) 编舞播放资源与缓存（sequence_source.py + choreography_player.py）
+│  ├─ 播放头（choreography_player.py / ChoreographyPlayer）
+│  │  ├─ start() 记录起始 perf_counter
+│  │  └─ frame_index() = int((now - t0 + offset) * fps)
+│  └─ 磁盘序列源（sequence_source.py / SequenceDiskSource）
+│     ├─ 输入：帧目录（*.png）→ 排序后得到 frame_paths[]
+│     ├─ 后台线程：预取未来帧到 QImage 缓存（解码在后台）
+│     ├─ UI 线程：把 QImage 转 QPixmap 并缩放（Qt 推荐 UI 线程做）
+│     ├─ 双层缓存：
+│     │  ├─ image_cache（QImage，后台填充）
+│     │  └─ pixmap_cache（QPixmap，按 size 缓存）
+│     ├─ LRU + 播放窗口裁剪（控制内存）
+│     └─ get_frame(i, size)：保证当前帧可用，否则同步加载兜底
+
+└─ 6) 线程模型与关键原则（全局）
+   ├─ 音频回调线程（sounddevice）：只做混音 + RingBuffer.write（轻量）
+   ├─ 后台预取线程（SequenceDiskSource）：只做磁盘 IO + 解码到 QImage
+   ├─ UI 主线程（Qt）：分析 tick / 状态机 / QPixmap 缩放 / setPixmap 绘制
+   └─ 缓存策略
+      ├─ 跟拍：AnimationBank 按 size 缩放缓存（需防尺寸爆炸）
+      └─ 编舞：SequenceDiskSource 预取 + LRU + pixmap 缓存（需干净 close）

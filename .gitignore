@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.idea/
+.venv/
+assets/
+*.mp4
+*.m4a
+*.wav
+*.png
+*.jpg
